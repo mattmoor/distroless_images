@@ -43,4 +43,15 @@ $(for p in ${PACKAGES}; do
   echo "\"$(package_name $(basename ${p}))\": \"@${NAME}_$(package_name $(basename ${p}))//lib\","
 done)
 }
+
+load("@distroless_images//python2.7:image.bzl", "py_image")
+
+def pip_image(**kwargs):
+  """Sugar for py_image with a layer per external requirement."""
+  if "layers" in kwargs:
+    fail("layers is a reserved kwarg to pip_image", attr="layers")
+
+  kwargs["layers"] = packages.values()
+  py_image(**kwargs)
+
 EOF
