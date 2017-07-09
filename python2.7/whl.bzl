@@ -16,13 +16,10 @@
 def _whl_impl(repository_ctx):
   """Core implementation of whl_library."""
 
-  # Add an empty top-level BUILD file.
-  # repository_ctx.file("BUILD", "")
-
   result = repository_ctx.execute([
     repository_ctx.path(repository_ctx.attr._script),
-    repository_ctx.attr.name,
     repository_ctx.path(repository_ctx.attr.whl),
+    repository_ctx.attr.requirements,
   ])
   if result.return_code:
     fail("whl_library failed: %s (%s)" % (result.stdout, result.stderr))
@@ -34,6 +31,7 @@ _whl_library = repository_rule(
           mandatory = True,
           single_file = True,
 	),
+        "requirements": attr.string(),
         "_script": attr.label(
             executable = True,
             default = Label("//python2.7:whl.sh"),
