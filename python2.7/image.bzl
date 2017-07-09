@@ -16,20 +16,6 @@
 The signature of this rule is compatible with py_binary.
 """
 
-# Perform a counting sort of the dependencies.
-def _sort_by_runfiles_length(deps):
-  count_to_deps = {}
-  for dep in deps:
-    count = len(dep.default_runfiles.files)
-    entries = count_to_deps.get(count, [])
-    entries += [dep]
-    count_to_deps[count] = entries
-
-  ordered_deps = []
-  for count in sorted(count_to_deps.keys()):
-    ordered_deps += count_to_deps[count]
-  return ordered_deps
-
 load(
   "@io_bazel_rules_docker//docker:build.bzl",
   _build_attrs="attrs",
@@ -37,73 +23,85 @@ load(
   _build_implementation="implementation",
 )
 
-def _impl(ctx):
-  """Core implementation of py_image."""
+def _dep_layer_impl(ctx):
+  """Appends a layer for a single dependencies runfiles."""
 
-  # We order the deps in increasing order of runfiles to
-  # put supersets last.
-  ordered_deps = _sort_by_runfiles_length(
-    ctx.attr.deps + [ctx.attr.binary])
+  return _build_implementation(
+    ctx, files=list(ctx.attr.dep.default_runfiles.files))
 
-  seen = set()
-  files = []
-  for dep in ordered_deps:
-    unique_files = set()
-    for input in list(dep.default_runfiles.files):
-      if input.path in seen:
-        continue
-      seen += [input.path]
-      unique_files += [input]
+_dep_layer = rule(
+    attrs = _build_attrs + {
+	# The base image on which to overlay the dependency layers.
+        "base": attr.label(default = Label("@py_base//image")),
+	# The dependency whose runfiles we're appending.
+        "dep": attr.label(mandatory = True),
 
-    if ctx.attr.dep and dep == ctx.attr.dep:
-      files = list(unique_files)
+        # Override the defaults.
+        "data_path": attr.string(default = "."),
+        # We put the files from dependency layers into a
+        # binary-agnostic path to increase the likelihood
+        # of layer sharing across images, then we symlink
+        # them into the appropriate place in the app layer.
+        "directory": attr.string(default = "/app"),
+    },
+    executable = True,
+    outputs = _build_outputs,
+    implementation = _dep_layer_impl,
+)
 
-  # TODO(mattmoor): Instead of using "deps" implicitly in this way,
-  # consider exposing a separate "layers" kwarg to augments "deps",
-  # but indicate the layering specializing.  These layers should
-  # include the transitive dependencies despite overlap with other
-  # layers. We should order this kwarg in the reverse of what we do
-  # above and elide layers that are fully covered.
+def _app_layer_impl(ctx):
+  """Appends the app layer with all remaining runfiles."""
 
-  # We put the files from dependency layers into a binary-agnostic
-  # path to increase the likelihood of layer sharing across images,
-  # then we symlink them into the appropriate place in the app layer.
-  dir = "/app"
-  cmd = []
-  symlinks = {}
-  if ctx.attr.binary == ctx.attr.dep:
-    name = ctx.attr.binary.label.name
-    binary_name = "/app/" + name
+  # Compute the set of runfiles that have been made available
+  # in our base image.
+  available = set()
+  for dep in ctx.attr.layers:
+    available += [f.short_path for f in dep.default_runfiles.files]
 
+  # The name of the binary target for which we are populating
+  # this application layer.
+  basename = ctx.attr.binary.label.name
+  binary_name = "/app/" + basename
+
+  # All of the files are included with paths relative to
+  # this directory.
+  # TODO(mattmoor): Might there be more path after the workspace?
+  directory = binary_name + ".runfiles/" + ctx.workspace_name
+
+  # Compute the set of remaining runfiles to include into the
+  # application layer.
+  files = [f for f in ctx.attr.binary.default_runfiles.files
+           if f.short_path not in available]
+
+  # For each of the runfiles we aren't including directly into
+  # the application layer, link to their binary-agnostic
+  # location from the runfiles path.
+  symlinks = {
+    # Bazel built binaries expect `python` on the path
+    # TODO(mattmoor): upstream a fix into distroless.
+    "/usr/bin/python": "/usr/bin/python2.7",
+    binary_name: directory + "/" + basename
+  } + {
+    directory + "/" + input: "/app/" + input
+    for input in available
+  }
+
+  return _build_implementation(
+    ctx, files=files,
     # TODO(mattmoor): Switch to entrypoint so we can more easily
     # add arguments when the resulting image is `docker run ...`.
     # Per: https://docs.docker.com/engine/reference/builder/#entrypoint
     # we should use the "exec" (list) form of entrypoint.
-    cmd = [binary_name]
-    dir = dir + "/" + name + ".runfiles/" + ctx.workspace_name
-    symlinks = {
-      # Bazel build binaries expect `python` on the path
-      # TODO(mattmoor): upstream a fix into distroless.
-      "/usr/bin/python": "/usr/bin/python2.7",
-      binary_name: dir + "/" + name
-    }
-    for input in list(ctx.attr.binary.default_runfiles.files):
-      if input in files:
-        continue
-      symlinks[dir + "/" + input.short_path] = "/app/" + input.short_path
+    cmd=[binary_name],
+    directory=directory, symlinks=symlinks)
 
-  return _build_implementation(ctx, files=files, cmd=cmd,
-                               directory=dir, symlinks=symlinks)
-
-_py_image = rule(
+_app_layer = rule(
     attrs = _build_attrs + {
         # The py_binary target for which we are synthesizing an image.
         "binary": attr.label(mandatory = True),
-	# The individual "dep" of the image whose runfiles belong in
-	# their own layer.
-        "dep": attr.label(),
-	# The full list of dependencies.
-        "deps": attr.label_list(),
+	# The full list of dependencies that have their own layers
+        # factored into our base.
+        "layers": attr.label_list(),
 	# The base image on which to overlay the dependency layers.
         "base": attr.label(default = Label("@py_base//image")),
 
@@ -113,10 +111,10 @@ _py_image = rule(
     },
     executable = True,
     outputs = _build_outputs,
-    implementation = _impl,
+    implementation = _app_layer_impl,
 )
 
-def py_image(name, deps, **kwargs):
+def py_image(name, deps, layers=[], **kwargs):
   """Constructs a Docker image wrapping a py_binary target.
 
   Args:
@@ -126,15 +124,15 @@ def py_image(name, deps, **kwargs):
 
   # TODO(mattmoor): Use par_binary instead, so that a single target
   # can be used for all three.
-  native.py_binary(name=binary_name, deps=deps, **kwargs)
+  native.py_binary(name=binary_name, deps=deps + layers, **kwargs)
 
   index = 0
-  base = None # use ctx.attr.base
-  for x in deps:
+  base = None # Makes us use ctx.attr.base
+  for dep in layers:
     this_name = "%s.%d" % (name, index)
-    _py_image(name=this_name, base=base, binary=binary_name, deps=deps, dep=x)
+    _dep_layer(name=this_name, base=base, dep=dep)
     base = this_name
     index += 1
 
-  _py_image(name=name, base=base, binary=binary_name, deps=deps, dep=binary_name)
+  _app_layer(name=name, base=base, binary=binary_name, layers=layers)
 
